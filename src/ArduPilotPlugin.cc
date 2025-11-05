@@ -21,6 +21,7 @@
 
 #include <gz/msgs/imu.pb.h>
 #include <gz/msgs/laserscan.pb.h>
+#include <gz/msgs/actuators.pb.h>
 
 #include <algorithm>
 #include <chrono>
@@ -124,6 +125,9 @@ class Control
 
   /// \brief The joint being controlled
   public: gz::sim::Entity joint;
+
+  /// \brief Index of motor in Actuators msg on multirotor_base.
+  public: int actuatorNumber = 0;
 
   /// \brief A multiplier to scale the raw input command
   public: double multiplier = 1.0;
@@ -444,7 +448,7 @@ void gz::sim::systems::ArduPilotPlugin::Configure(
     gz::sim::EventManager &/*&_eventMgr*/)
 {
   // Make a clone so that we can call non-const methods
-  sdf::ElementPtr sdfClone = _sdf->Clone();
+  sdf::ElementPtr controlSDF = _sdf->Clone();
 
   this->dataPtr->model = gz::sim::Model(_entity);
   if (!this->dataPtr->model.Valid(_ecm))
@@ -472,46 +476,46 @@ void gz::sim::systems::ArduPilotPlugin::Configure(
   // to the aerospace convention: x-forward, y-left, z-up
   this->dataPtr->modelXYZToAirplaneXForwardZDown =
     gz::math::Pose3d(0, 0, 0, GZ_PI, 0, 0);
-  if (sdfClone->HasElement("modelXYZToAirplaneXForwardZDown"))
+  if (controlSDF->HasElement("modelXYZToAirplaneXForwardZDown"))
   {
     this->dataPtr->modelXYZToAirplaneXForwardZDown =
-        sdfClone->Get<gz::math::Pose3d>("modelXYZToAirplaneXForwardZDown");
+        controlSDF->Get<gz::math::Pose3d>("modelXYZToAirplaneXForwardZDown");
   }
 
   // gazeboXYZToNED: from gazebo model frame: x-forward, y-right, z-down
   // to the aerospace convention: x-forward, y-left, z-up
   this->dataPtr->gazeboXYZToNED = gz::math::Pose3d(0, 0, 0, GZ_PI, 0, 0);
-  if (sdfClone->HasElement("gazeboXYZToNED"))
+  if (controlSDF->HasElement("gazeboXYZToNED"))
   {
     this->dataPtr->gazeboXYZToNED =
-        sdfClone->Get<gz::math::Pose3d>("gazeboXYZToNED");
+        controlSDF->Get<gz::math::Pose3d>("gazeboXYZToNED");
   }
 
   // Load control channel params
-  this->LoadControlChannels(sdfClone, _ecm);
+  this->LoadControlChannels(controlSDF, _ecm);
 
   // Load sensor params
-  this->LoadImuSensors(sdfClone, _ecm);
-  this->LoadGpsSensors(sdfClone, _ecm);
-  this->LoadRangeSensors(sdfClone, _ecm);
-  this->LoadWindSensors(sdfClone, _ecm);
+  this->LoadImuSensors(controlSDF, _ecm);
+  this->LoadGpsSensors(controlSDF, _ecm);
+  this->LoadRangeSensors(controlSDF, _ecm);
+  this->LoadWindSensors(controlSDF, _ecm);
 
   // Initialise sockets
-  if (!InitSockets(sdfClone))
+  if (!InitSockets(controlSDF))
   {
     return;
   }
 
   // Missed update count before we declare arduPilotOnline status false
   this->dataPtr->connectionTimeoutMaxCount =
-    sdfClone->Get("connectionTimeoutMaxCount", 10).first;
+    controlSDF->Get("connectionTimeoutMaxCount", 10).first;
 
   // Enforce lock-step simulation (has default: false)
   this->dataPtr->isLockStep =
-    sdfClone->Get("lock_step", this->dataPtr->isLockStep).first;
+    controlSDF->Get("lock_step", this->dataPtr->isLockStep).first;
 
   this->dataPtr->have32Channels =
-    sdfClone->Get("have_32_channels", false).first;
+    controlSDF->Get("have_32_channels", false).first;
 
   // Add the signal handler
   this->dataPtr->sigHandler.AddCallback(
@@ -526,19 +530,18 @@ void gz::sim::systems::ArduPilotPlugin::Configure(
 
 /////////////////////////////////////////////////
 void gz::sim::systems::ArduPilotPlugin::LoadControlChannels(
-    sdf::ElementPtr _sdf,
-    gz::sim::EntityComponentManager &_ecm)
+  sdf::ElementPtr _sdf,
+  gz::sim::EntityComponentManager& _ecm)
 {
   // per control channel
   sdf::ElementPtr controlSDF;
   if (_sdf->HasElement("control"))
   {
     controlSDF = _sdf->GetElement("control");
-  }
-  else if (_sdf->HasElement("rotor"))
+  } else if (_sdf->HasElement("rotor"))
   {
     gzwarn << "[" << this->dataPtr->modelName << "] "
-           << "please deprecate <rotor> block, use <control> block instead.\n";
+      << "please deprecate <rotor> block, use <control> block instead.\n";
     controlSDF = _sdf->GetElement("rotor");
   }
 
@@ -550,44 +553,42 @@ void gz::sim::systems::ArduPilotPlugin::LoadControlChannels(
     {
       control.channel =
         atoi(controlSDF->GetAttribute("channel")->GetAsString().c_str());
-    }
-    else if (controlSDF->HasAttribute("id"))
+    } else if (controlSDF->HasAttribute("id"))
     {
       gzwarn << "[" << this->dataPtr->modelName << "] "
-             <<  "please deprecate attribute id, use channel instead.\n";
+        << "please deprecate attribute id, use channel instead.\n";
       control.channel =
         atoi(controlSDF->GetAttribute("id")->GetAsString().c_str());
-    }
-    else
+    } else
     {
       control.channel = this->dataPtr->controls.size();
       gzwarn << "[" << this->dataPtr->modelName << "] "
-             <<  "id/channel attribute not specified, use order parsed ["
-             << control.channel << "].\n";
+        << "id/channel attribute not specified, use order parsed ["
+        << control.channel << "].\n";
     }
 
     if (controlSDF->HasElement("type"))
     {
       control.type = controlSDF->Get<std::string>("type");
-    }
-    else
+    } else
     {
       gzerr << "[" << this->dataPtr->modelName << "] "
-            <<  "Control type not specified,"
-            << " using velocity control by default.\n";
+        << "Control type not specified,"
+        << " using velocity control by default.\n";
       control.type = "VELOCITY";
     }
 
     if (control.type != "VELOCITY" &&
-        control.type != "POSITION" &&
-        control.type != "EFFORT" &&
-        control.type != "COMMAND")
+      control.type != "POSITION" &&
+      control.type != "EFFORT" &&
+      control.type != "COMMAND" &&
+      control.type != "COMMAND_ACTUATOR")
     {
       gzwarn << "[" << this->dataPtr->modelName << "] "
-             << "Control type [" << control.type
-             << "] not recognized, must be one of"
-             << "VELOCITY, POSITION, EFFORT, COMMAND."
-             << " default to VELOCITY.\n";
+        << "Control type [" << control.type
+        << "] not recognized, must be one of"
+        << "VELOCITY, POSITION, EFFORT, COMMAND, COMMAND_ACTUATOR."
+        << " default to VELOCITY.\n";
       control.type = "VELOCITY";
     }
 
@@ -599,139 +600,135 @@ void gz::sim::systems::ArduPilotPlugin::LoadControlChannels(
     if (controlSDF->HasElement("jointName"))
     {
       control.jointName = controlSDF->Get<std::string>("jointName");
-    }
-    else
+    } else
     {
       gzerr << "[" << this->dataPtr->modelName << "] "
-            << "Please specify a jointName,"
-            << " where the control channel is attached.\n";
+        << "Please specify a jointName,"
+        << " where the control channel is attached.\n";
     }
 
     // Get the pointer to the joint.
     control.joint = JointByName(_ecm,
-        this->dataPtr->model.Entity(), control.jointName);
+      this->dataPtr->model.Entity(), control.jointName);
     if (control.joint == gz::sim::kNullEntity)
     {
       gzerr << "[" << this->dataPtr->modelName << "] "
-            << "Couldn't find specified joint ["
-            << control.jointName << "]. This plugin will not run.\n";
+        << "Couldn't find specified joint ["
+        << control.jointName << "]. This plugin will not run.\n";
       return;
     }
 
     // set up publisher if relaying the command
-    if (control.type == "COMMAND")
+    if (control.type == "COMMAND" || control.type == "COMMAND_ACTUATOR")
     {
       if (controlSDF->HasElement("cmd_topic"))
       {
         control.cmdTopic = controlSDF->Get<std::string>("cmd_topic");
-      }
-      else
-      {
+      } else {
         control.cmdTopic =
-            "/world/" + this->dataPtr->worldName
+          "/world/" + this->dataPtr->worldName
           + "/model/" + this->dataPtr->modelName
           + "/joint/" + control.jointName + "/cmd";
         gzwarn << "[" << this->dataPtr->modelName << "] "
-            << "Control type [" << control.type
-            << "] requires a valid <cmd_topic>. Using default\n";
+          << "Control type [" << control.type
+          << "] requires a valid <cmd_topic>. Using default\n";
       }
 
       gzmsg << "[" << this->dataPtr->modelName << "] "
         << "Advertising on " << control.cmdTopic << ".\n";
-      control.pub = this->dataPtr->
+
+      if (control.type == "COMMAND") {
+        control.pub = this->dataPtr->
           node.Advertise<msgs::Double>(control.cmdTopic);
+      } else if (control.type == "COMMAND_ACTUATOR") {
+        control.pub = this->dataPtr->
+          node.Advertise<msgs::Actuators>(control.cmdTopic);
+      }
     }
 
     if (controlSDF->HasElement("multiplier"))
     {
       // overwrite turningDirection, deprecated.
       control.multiplier = controlSDF->Get<double>("multiplier");
-    }
-    else if (controlSDF->HasElement("turningDirection"))
+    } else if (controlSDF->HasElement("turningDirection"))
     {
       gzwarn << "[" << this->dataPtr->modelName << "] "
-             << "<turningDirection> is deprecated. Please use"
-             << " <multiplier>. Map 'cw' to '-1' and 'ccw' to '1'.\n";
+        << "<turningDirection> is deprecated. Please use"
+        << " <multiplier>. Map 'cw' to '-1' and 'ccw' to '1'.\n";
       std::string turningDirection = controlSDF->Get<std::string>(
-          "turningDirection");
+        "turningDirection");
       // special cases mimic from controls_gazebo_plugins
       if (turningDirection == "cw")
       {
         control.multiplier = -1;
-      }
-      else if (turningDirection == "ccw")
+      } else if (turningDirection == "ccw")
       {
         control.multiplier = 1;
-      }
-      else
+      } else
       {
         gzdbg << "[" << this->dataPtr->modelName << "] "
-              << "not string, check turningDirection as float\n";
+          << "not string, check turningDirection as float\n";
         control.multiplier = controlSDF->Get<double>("turningDirection");
       }
-    }
-    else
+    } else
     {
       gzdbg << "[" << this->dataPtr->modelName << "] "
-            << "channel[" << control.channel
-            << "]: <multiplier> (or deprecated <turningDirection>)"
-            << " not specified, "
-            << " default to " << control.multiplier
-            << " (or deprecated <turningDirection> 'ccw').\n";
+        << "channel[" << control.channel
+        << "]: <multiplier> (or deprecated <turningDirection>)"
+        << " not specified, "
+        << " default to " << control.multiplier
+        << " (or deprecated <turningDirection> 'ccw').\n";
     }
 
     if (controlSDF->HasElement("offset"))
     {
       control.offset = controlSDF->Get<double>("offset");
-    }
-    else
+    } else
     {
       gzdbg << "[" << this->dataPtr->modelName << "] "
-            << "channel[" << control.channel
-            << "]: <offset> not specified, default to "
-            << control.offset << "\n";
+        << "channel[" << control.channel
+        << "]: <offset> not specified, default to "
+        << control.offset << "\n";
     }
 
     if (controlSDF->HasElement("servo_min"))
     {
       control.servo_min = controlSDF->Get<double>("servo_min");
-    }
-    else
+    } else
     {
       gzdbg << "[" << this->dataPtr->modelName << "] "
-            << "channel[" << control.channel
-            << "]: <servo_min> not specified, default to "
-            << control.servo_min << "\n";
+        << "channel[" << control.channel
+        << "]: <servo_min> not specified, default to "
+        << control.servo_min << "\n";
     }
 
     if (controlSDF->HasElement("servo_max"))
     {
       control.servo_max = controlSDF->Get<double>("servo_max");
-    }
-    else
+    } else
     {
       gzdbg << "[" << this->dataPtr->modelName << "] "
-            << "channel[" << control.channel
-            << "]: <servo_max> not specified, default to "
-            << control.servo_max << "\n";
+        << "channel[" << control.channel
+        << "]: <servo_max> not specified, default to "
+        << control.servo_max << "\n";
     }
 
     control.rotorVelocitySlowdownSim =
-        controlSDF->Get("rotorVelocitySlowdownSim", 1).first;
+      controlSDF->Get("rotorVelocitySlowdownSim", 1).first;
 
     if (gz::math::equal(control.rotorVelocitySlowdownSim, 0.0))
     {
       gzwarn << "[" << this->dataPtr->modelName << "] "
-             << "control for joint [" << control.jointName
-             << "] rotorVelocitySlowdownSim is zero,"
-             << " assume no slowdown.\n";
+        << "control for joint [" << control.jointName
+        << "] rotorVelocitySlowdownSim is zero,"
+        << " assume no slowdown.\n";
       control.rotorVelocitySlowdownSim = 1.0;
     }
 
     control.frequencyCutoff =
-          controlSDF->Get("frequencyCutoff", control.frequencyCutoff).first;
+      controlSDF->Get("frequencyCutoff", control.frequencyCutoff).first;
     control.samplingRate =
-          controlSDF->Get("samplingRate", control.samplingRate).first;
+      controlSDF->Get("samplingRate", control.samplingRate).first;
 
     // use gazebo::math::Filter
     control.filter.Fc(control.frequencyCutoff, control.samplingRate);
@@ -790,6 +787,13 @@ void gz::sim::systems::ArduPilotPlugin::LoadControlChannels(
 
     // set pid initial command
     control.pid.SetCmd(0.0);
+
+    if (controlSDF->HasElement("actuator_number")) {
+      control.actuatorNumber =
+        controlSDF->GetElement("actuator_number")->Get<int>();
+    } else if (control.type == "COMMAND_ACTUATOR") {
+      gzerr << "Please specify a actuator_number.\n";
+    }
 
     this->dataPtr->controls.push_back(control);
     controlSDF = controlSDF->GetNextElement("control");
@@ -1311,6 +1315,17 @@ void gz::sim::systems::ArduPilotPlugin::ApplyMotorForces(
     {
       msgs::Double cmd;
       cmd.set_data(this->dataPtr->controls[i].cmd);
+      this->dataPtr->controls[i].pub.Publish(cmd);
+      continue;
+    }
+
+    if (this->dataPtr->controls[i].type == "COMMAND_ACTUATOR")
+    {
+      msgs::Actuators cmd {};
+      for(uint8_t j = 0; j < this->dataPtr->controls[i].actuatorNumber; j++) {
+        cmd.add_velocity(0.0);
+      }
+      cmd.add_velocity(this->dataPtr->controls[i].cmd);
       this->dataPtr->controls[i].pub.Publish(cmd);
       continue;
     }

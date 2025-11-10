@@ -141,7 +141,11 @@ class GZ_SIM_VISIBLE ArduPilotPlugin:
   /// \brief Load wind sensors
   private: void LoadWindSensors(
       sdf::ElementPtr _sdf,
-      gz::sim::EntityComponentManager &_ecm);
+      gz::sim::EntityComponentManager& _ecm);
+
+  private: bool LoadCatapult(
+      sdf::ElementPtr _sdf,
+      gz::sim::EntityComponentManager& _ecm);
 
   /// \brief Update the control surfaces controllers.
   /// \param[in] _info Update information provided by the server.

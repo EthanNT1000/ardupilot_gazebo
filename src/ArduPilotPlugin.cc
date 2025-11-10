@@ -49,6 +49,7 @@
 #include <gz/sim/components/World.hh>
 #include <gz/sim/Model.hh>
 #include <gz/sim/World.hh>
+#include <gz/sim/Link.hh>
 #include <gz/sim/Util.hh>
 #include <gz/math/Filter.hh>
 #include <gz/math/Helpers.hh>
@@ -194,12 +195,19 @@ class OnMessageWrapper
 };
 
 typedef std::shared_ptr<OnMessageWrapper<
-    gz::msgs::LaserScan>> RangeOnMessageWrapperPtr;
+  gz::msgs::LaserScan>> RangeOnMessageWrapperPtr;
 
 /////////////////////////////////////////////////
 // Private data class
 class gz::sim::systems::ArduPilotPluginPrivate
 {
+  public: typedef enum class LaunchStatus : uint8_t {
+    Standby,
+    preLaunch,
+    InLaunched,
+    Launched
+  } LaunchStatus;
+
   /// \brief The model
   public: gz::sim::Model model{gz::sim::kNullEntity};
 
@@ -241,6 +249,30 @@ class gz::sim::systems::ArduPilotPluginPrivate
 
   /// \brief The port for the SITL flight controller - auto detected
   public: uint16_t fcu_port_out;
+
+  public: bool hasCatapult;
+
+  public: LaunchStatus launchStatus {};
+
+  public: gz::sim::Link catapultApplyLink{gz::sim::kNullEntity};
+
+  public: gz::math::Vector3d catapultForce;
+
+  public: double catapultDuration;
+
+  public: std::chrono::_V2::steady_clock::duration catapultTriggerTime;
+
+  /// \brief This mutex must be used when accessing the catapult cmd.
+  public: std::mutex catapultCmdMutex;
+
+  /// \brief Callback for the catapult.
+  public: void CatapultCb(const gz::msgs::Empty &_msg)
+  {
+    std::lock_guard<std::mutex> lock(this->catapultCmdMutex);
+    if (launchStatus == LaunchStatus::Standby) {
+      launchStatus = LaunchStatus::preLaunch;
+    }
+  }
 
   /// \brief The name of the IMU sensor
   public: std::string imuName;
@@ -499,6 +531,8 @@ void gz::sim::systems::ArduPilotPlugin::Configure(
   this->LoadGpsSensors(controlSDF, _ecm);
   this->LoadRangeSensors(controlSDF, _ecm);
   this->LoadWindSensors(controlSDF, _ecm);
+
+  this->dataPtr->hasCatapult = this->LoadCatapult(controlSDF, _ecm);
 
   // Initialise sockets
   if (!InitSockets(controlSDF))
@@ -1008,224 +1042,290 @@ void gz::sim::systems::ArduPilotPlugin::LoadWindSensors(
 }
 
 /////////////////////////////////////////////////
+bool gz::sim::systems::ArduPilotPlugin::LoadCatapult(
+  sdf::ElementPtr _sdf,
+  gz::sim::EntityComponentManager& _ecm) {
+  sdf::ElementPtr controlSDF;
+  if (_sdf->HasElement("catapult"))
+  {
+    controlSDF = _sdf->GetElement("catapult");
+
+    std::string linkName = "";
+    if (controlSDF->HasElement("link")) {
+      linkName = controlSDF->Get<std::string>("link");
+    }
+
+    if (linkName.empty()) {
+      gzerr << "[" << this->dataPtr->modelName << "] "
+        << "catapult requires a valid <link>\n";
+      return false;
+    }
+    this->dataPtr->catapultApplyLink
+      = gz::sim::Link(this->dataPtr->model.LinkByName(_ecm, linkName));
+
+    this->dataPtr->catapultDuration = controlSDF->Get("duration", 0.0).first;
+
+    double forceMagnitude = controlSDF->Get("force", 0.0).first;
+    double catapultPitch = controlSDF->Get("pitch", 0.0).first;
+    gz::math::Vector3d direction = gz::math::Vector3d(
+      cos(catapultPitch),
+      0.0,
+      sin(catapultPitch)
+    );
+    direction.Normalize();
+    const auto worldPose = this->dataPtr->catapultApplyLink.WorldPose(_ecm);
+    this->dataPtr->catapultForce =
+      worldPose->Rot().RotateVector(forceMagnitude * direction);
+
+    std::string _topic;
+    if (controlSDF->HasElement("cmd_topic")) {
+      _topic = controlSDF->Get<std::string>("cmd_topic");
+    } else {
+      _topic =
+        "/world/" + this->dataPtr->worldName
+        + "/model/" + this->dataPtr->modelName
+        + "/catapult/cmd";
+      gzwarn << "[" << this->dataPtr->modelName << "] "
+        << "catapult requires a valid <cmd_topic>. Using default\n";
+    }
+
+    this->dataPtr->node.Subscribe(_topic,
+      &gz::sim::systems::ArduPilotPluginPrivate::CatapultCb,
+      this->dataPtr.get());
+
+    gzmsg << "[" << this->dataPtr->modelName << "] "
+      << "Subscribing to " << _topic << ".\n";
+
+    return true;
+  }
+  return false;
+}
+
+/////////////////////////////////////////////////
 void gz::sim::systems::ArduPilotPlugin::PreUpdate(
-    const gz::sim::UpdateInfo &_info,
-    gz::sim::EntityComponentManager &_ecm)
+  const gz::sim::UpdateInfo& _info,
+  gz::sim::EntityComponentManager& _ecm)
 {
-    static bool calledInitAnemometerOnce{false};
-    if (!this->dataPtr->anemometerName.empty() &&
-        !this->dataPtr->anemometerInitialized &&
-        !calledInitAnemometerOnce)
+  static bool calledInitAnemometerOnce { false };
+  if (!this->dataPtr->anemometerName.empty() &&
+    !this->dataPtr->anemometerInitialized &&
+    !calledInitAnemometerOnce)
+  {
+    calledInitAnemometerOnce = true;
+    std::string anemometerTopicName;
+
+    // try scoped names first
+    auto entities = entitiesFromScopedName(
+      this->dataPtr->anemometerName, _ecm, this->dataPtr->model.Entity());
+
+    // fall-back to unscoped name
+    if (entities.empty())
     {
-        calledInitAnemometerOnce = true;
-        std::string anemometerTopicName;
-
-        // try scoped names first
-        auto entities = entitiesFromScopedName(
-            this->dataPtr->anemometerName, _ecm, this->dataPtr->model.Entity());
-
-        // fall-back to unscoped name
-        if (entities.empty())
-        {
-          entities = EntitiesFromUnscopedName(
-            this->dataPtr->anemometerName, _ecm, this->dataPtr->model.Entity());
-        }
-
-        if (!entities.empty())
-        {
-          if (entities.size() > 1)
-          {
-            gzwarn << "Multiple anemometers with name ["
-                   << this->dataPtr->anemometerName << "] found. "
-                   << "Using the first one.\n";
-          }
-
-          // select first entity
-          this->dataPtr->anemometerEntity = *entities.begin();
-
-          // validate
-          if (!_ecm.EntityHasComponentType(this->dataPtr->anemometerEntity,
-              gz::sim::components::CustomSensor::typeId))
-          {
-            gzerr << "Entity with name ["
-                  << this->dataPtr->anemometerName
-                  << "] is not an anemometer.\n";
-          }
-          else
-          {
-            gzmsg << "Found anemometer with name ["
-                  << this->dataPtr->anemometerName
-                  << "].\n";
-
-            // verify the parent of the anemometer is a link.
-            gz::sim::Entity parent = _ecm.ParentEntity(
-                this->dataPtr->anemometerEntity);
-            if (_ecm.EntityHasComponentType(parent,
-                gz::sim::components::Link::typeId))
-            {
-                anemometerTopicName = gz::sim::scopedName(
-                    this->dataPtr->anemometerEntity, _ecm) + "/anemometer";
-
-                gzdbg << "Computed anemometers topic to be: "
-                    << anemometerTopicName << ".\n";
-            }
-            else
-            {
-              gzerr << "Parent of anemometer ["
-                    << this->dataPtr->anemometerName
-                    << "] is not a link.\n";
-            }
-          }
-        }
-        else
-        {
-            gzerr << "[" << this->dataPtr->modelName << "] "
-                  << "anemometer [" << this->dataPtr->anemometerName
-                  << "] not found, abort ArduPilot plugin." << "\n";
-            return;
-        }
-
-        this->dataPtr->node.Subscribe(anemometerTopicName,
-            &gz::sim::systems::ArduPilotPluginPrivate::AnemometerCb,
-            this->dataPtr.get());
-
-        // Make sure that the anemometer entity has WorldPose
-        // and WorldLinearVelocity components, which we'll need later.
-        enableComponent<components::WorldPose>(
-            _ecm, this->dataPtr->anemometerEntity, true);
-        enableComponent<components::WorldLinearVelocity>(
-            _ecm, this->dataPtr->anemometerEntity, true);
-
-        this->dataPtr->anemometerInitialized = true;
+      entities = EntitiesFromUnscopedName(
+        this->dataPtr->anemometerName, _ecm, this->dataPtr->model.Entity());
     }
 
-    // This lookup is done in PreUpdate() because in Configure()
-    // it's not possible to get the fully qualified topic name we want
-    if (!this->dataPtr->imuInitialized)
+    if (!entities.empty())
     {
-        // Set unconditionally because we're only going to try this once.
-        this->dataPtr->imuInitialized = true;
-        std::string imuTopicName;
+      if (entities.size() > 1)
+      {
+        gzwarn << "Multiple anemometers with name ["
+          << this->dataPtr->anemometerName << "] found. "
+          << "Using the first one.\n";
+      }
 
-        // The model must contain an imu sensor element:
-        //  <sensor name="..." type="imu">
-        //
-        // Extract the following:
-        //  - Sensor topic name: to subscribe to the imu data
-        //  - Link containing the sensor: to get the pose to transform to
-        //    the correct frame for ArduPilot
+      // select first entity
+      this->dataPtr->anemometerEntity = *entities.begin();
 
-        // try scoped names first
-        auto entities = entitiesFromScopedName(
-            this->dataPtr->imuName, _ecm, this->dataPtr->model.Entity());
+      // validate
+      if (!_ecm.EntityHasComponentType(this->dataPtr->anemometerEntity,
+        gz::sim::components::CustomSensor::typeId))
+      {
+        gzerr << "Entity with name ["
+          << this->dataPtr->anemometerName
+          << "] is not an anemometer.\n";
+      } else
+      {
+        gzmsg << "Found anemometer with name ["
+          << this->dataPtr->anemometerName
+          << "].\n";
 
-        // fall-back to unscoped name
-        if (entities.empty())
+        // verify the parent of the anemometer is a link.
+        gz::sim::Entity parent = _ecm.ParentEntity(
+          this->dataPtr->anemometerEntity);
+        if (_ecm.EntityHasComponentType(parent,
+          gz::sim::components::Link::typeId))
         {
-          entities = EntitiesFromUnscopedName(
-            this->dataPtr->imuName, _ecm, this->dataPtr->model.Entity());
-        }
+          anemometerTopicName = gz::sim::scopedName(
+            this->dataPtr->anemometerEntity, _ecm) + "/anemometer";
 
-        if (!entities.empty())
+          gzdbg << "Computed anemometers topic to be: "
+            << anemometerTopicName << ".\n";
+        } else
         {
-          if (entities.size() > 1)
-          {
-            gzwarn << "Multiple IMU sensors with name ["
-                   << this->dataPtr->imuName << "] found. "
-                   << "Using the first one.\n";
-          }
-
-          // select first entity
-          gz::sim::Entity imuEntity = *entities.begin();
-
-          // validate
-          if (!_ecm.EntityHasComponentType(imuEntity,
-              gz::sim::components::Imu::typeId))
-          {
-            gzerr << "Entity with name ["
-                  << this->dataPtr->imuName
-                  << "] is not an IMU sensor\n";
-          }
-          else
-          {
-            gzmsg << "Found IMU sensor with name ["
-                  << this->dataPtr->imuName
-                  << "]\n";
-
-            // verify the parent of the imu sensor is a link.
-            gz::sim::Entity parent = _ecm.ParentEntity(imuEntity);
-            if (_ecm.EntityHasComponentType(parent,
-                gz::sim::components::Link::typeId))
-            {
-                this->dataPtr->imuLink = parent;
-
-                imuTopicName = gz::sim::scopedName(
-                    imuEntity, _ecm) + "/imu";
-
-                gzdbg << "Computed IMU topic to be: "
-                    << imuTopicName << std::endl;
-            }
-            else
-            {
-              gzerr << "Parent of IMU sensor ["
-                    << this->dataPtr->imuName
-                    << "] is not a link\n";
-            }
-          }
+          gzerr << "Parent of anemometer ["
+            << this->dataPtr->anemometerName
+            << "] is not a link.\n";
         }
-        else
-        {
-            gzerr << "[" << this->dataPtr->modelName << "] "
-                  << "imu_sensor [" << this->dataPtr->imuName
-                  << "] not found, abort ArduPilot plugin." << "\n";
-            return;
-        }
-
-        this->dataPtr->node.Subscribe(imuTopicName,
-            &gz::sim::systems::ArduPilotPluginPrivate::ImuCb,
-            this->dataPtr.get());
-
-        // Make sure that the 'imuLink' entity has WorldPose
-        // and WorldLinearVelocity components, which we'll need later.
-        enableComponent<components::WorldPose>(
-            _ecm, this->dataPtr->imuLink, true);
-        enableComponent<components::WorldLinearVelocity>(
-            _ecm, this->dataPtr->imuLink, true);
-    }
-    else
+      }
+    } else
     {
-        // Update the control surfaces.
-        if (!_info.paused && _info.simTime >
-            this->dataPtr->lastControllerUpdateTime)
-        {
-            if (this->dataPtr->isLockStep)
-            {
-                while (!this->ReceiveServoPacket() &&
-                    this->dataPtr->arduPilotOnline)
-                {
-                    // SIGNINT should interrupt this loop.
-                    if (this->dataPtr->signal != 0)
-                    {
-                        break;
-                    }
-                }
-                this->dataPtr->lastServoPacketRecvTime = _info.simTime;
-            }
-            else if (this->ReceiveServoPacket())
-            {
-                this->dataPtr->lastServoPacketRecvTime = _info.simTime;
-            }
-
-            if (this->dataPtr->arduPilotOnline)
-            {
-                double dt =
-                    std::chrono::duration_cast<std::chrono::duration<double> >(
-                        _info.simTime - this->dataPtr->
-                            lastControllerUpdateTime).count();
-                this->ApplyMotorForces(dt, _ecm);
-            }
-        }
+      gzerr << "[" << this->dataPtr->modelName << "] "
+        << "anemometer [" << this->dataPtr->anemometerName
+        << "] not found, abort ArduPilot plugin." << "\n";
+      return;
     }
+
+    this->dataPtr->node.Subscribe(anemometerTopicName,
+      &gz::sim::systems::ArduPilotPluginPrivate::AnemometerCb,
+      this->dataPtr.get());
+
+    // Make sure that the anemometer entity has WorldPose
+    // and WorldLinearVelocity components, which we'll need later.
+    enableComponent<components::WorldPose>(
+      _ecm, this->dataPtr->anemometerEntity, true);
+    enableComponent<components::WorldLinearVelocity>(
+      _ecm, this->dataPtr->anemometerEntity, true);
+
+    this->dataPtr->anemometerInitialized = true;
+  }
+
+  // This lookup is done in PreUpdate() because in Configure()
+  // it's not possible to get the fully qualified topic name we want
+  if (!this->dataPtr->imuInitialized)
+  {
+    // Set unconditionally because we're only going to try this once.
+    this->dataPtr->imuInitialized = true;
+    std::string imuTopicName;
+
+    // The model must contain an imu sensor element:
+    //  <sensor name="..." type="imu">
+    //
+    // Extract the following:
+    //  - Sensor topic name: to subscribe to the imu data
+    //  - Link containing the sensor: to get the pose to transform to
+    //    the correct frame for ArduPilot
+
+    // try scoped names first
+    auto entities = entitiesFromScopedName(
+      this->dataPtr->imuName, _ecm, this->dataPtr->model.Entity());
+
+    // fall-back to unscoped name
+    if (entities.empty())
+    {
+      entities = EntitiesFromUnscopedName(
+        this->dataPtr->imuName, _ecm, this->dataPtr->model.Entity());
+    }
+
+    if (!entities.empty())
+    {
+      if (entities.size() > 1)
+      {
+        gzwarn << "Multiple IMU sensors with name ["
+          << this->dataPtr->imuName << "] found. "
+          << "Using the first one.\n";
+      }
+
+      // select first entity
+      gz::sim::Entity imuEntity = *entities.begin();
+
+      // validate
+      if (!_ecm.EntityHasComponentType(imuEntity,
+        gz::sim::components::Imu::typeId))
+      {
+        gzerr << "Entity with name ["
+          << this->dataPtr->imuName
+          << "] is not an IMU sensor\n";
+      } else
+      {
+        gzmsg << "Found IMU sensor with name ["
+          << this->dataPtr->imuName
+          << "]\n";
+
+        // verify the parent of the imu sensor is a link.
+        gz::sim::Entity parent = _ecm.ParentEntity(imuEntity);
+        if (_ecm.EntityHasComponentType(parent,
+          gz::sim::components::Link::typeId))
+        {
+          this->dataPtr->imuLink = parent;
+
+          imuTopicName = gz::sim::scopedName(
+            imuEntity, _ecm) + "/imu";
+
+          gzdbg << "Computed IMU topic to be: "
+            << imuTopicName << std::endl;
+        } else
+        {
+          gzerr << "Parent of IMU sensor ["
+            << this->dataPtr->imuName
+            << "] is not a link\n";
+        }
+      }
+    } else
+    {
+      gzerr << "[" << this->dataPtr->modelName << "] "
+        << "imu_sensor [" << this->dataPtr->imuName
+        << "] not found, abort ArduPilot plugin." << "\n";
+      return;
+    }
+
+    this->dataPtr->node.Subscribe(imuTopicName,
+      &gz::sim::systems::ArduPilotPluginPrivate::ImuCb,
+      this->dataPtr.get());
+
+    // Make sure that the 'imuLink' entity has WorldPose
+    // and WorldLinearVelocity components, which we'll need later.
+    enableComponent<components::WorldPose>(
+      _ecm, this->dataPtr->imuLink, true);
+    enableComponent<components::WorldLinearVelocity>(
+      _ecm, this->dataPtr->imuLink, true);
+  } else
+  {
+    if (this->dataPtr->hasCatapult) {
+      std::lock_guard<std::mutex> lock(this->dataPtr->catapultCmdMutex);
+      if (this->dataPtr->launchStatus == ArduPilotPluginPrivate::LaunchStatus::preLaunch) {
+        this->dataPtr->catapultTriggerTime = _info.simTime;
+        this->dataPtr->launchStatus = ArduPilotPluginPrivate::LaunchStatus::InLaunched;
+      } else if (this->dataPtr->launchStatus == ArduPilotPluginPrivate::LaunchStatus::InLaunched) {
+        this->dataPtr->catapultApplyLink.AddWorldForce(_ecm, this->dataPtr->catapultForce);
+
+        if (std::chrono::duration<double>(
+          _info.simTime - this->dataPtr->catapultTriggerTime).count() > this->dataPtr->catapultDuration)
+          this->dataPtr->launchStatus = ArduPilotPluginPrivate::LaunchStatus::Launched;
+      }
+    }
+
+    // Update the control surfaces.
+    if (!_info.paused && _info.simTime >
+      this->dataPtr->lastControllerUpdateTime)
+    {
+      if (this->dataPtr->isLockStep)
+      {
+        while (!this->ReceiveServoPacket() &&
+          this->dataPtr->arduPilotOnline)
+        {
+          // SIGNINT should interrupt this loop.
+          if (this->dataPtr->signal != 0)
+          {
+            break;
+          }
+        }
+        this->dataPtr->lastServoPacketRecvTime = _info.simTime;
+      } else if (this->ReceiveServoPacket())
+      {
+        this->dataPtr->lastServoPacketRecvTime = _info.simTime;
+      }
+
+      if (this->dataPtr->arduPilotOnline)
+      {
+        double dt =
+          std::chrono::duration_cast<std::chrono::duration<double>>(
+            _info.simTime - this->dataPtr->
+            lastControllerUpdateTime).count();
+        this->ApplyMotorForces(dt, _ecm);
+      }
+    }
+  }
 }
 
 /////////////////////////////////////////////////
